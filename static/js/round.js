@@ -80,6 +80,9 @@
       $("resultSeed").textContent = round.seed;
       $("revealedAt").textContent = round.revealedAt || "";
       var forfeits = round.forfeits || [];
+      var confirms = round.confirmations || [];
+      var confirmedBySlot = {};
+      confirms.forEach(function (c) { confirmedBySlot[c.slot] = c; });
       var replay = LotteryRules.replaySlots(round.winners || [], forfeits);
       $("winnerList").innerHTML = (round.winners || []).map(function (w, i) {
         var cur = replay.slots[i];
@@ -89,9 +92,16 @@
           : (cur === w
               ? '<span class="mono">🏆 ' + UI.esc(cur) + "</span>"
               : '<span class="mono tag-new">🏆 ' + UI.esc(cur) + "（递补）</span>");
-        var action = cur == null
-          ? ""
-          : '<button class="danger" data-forfeit="' + UI.esc(cur) + '">弃权</button>';
+        var action;
+        var confirmed = confirmedBySlot[i];
+        if (confirmed) {
+          action = '<span class="tag-new">✅ 已确认发放给 ' + UI.esc(confirmed.entry) + "</span>";
+        } else if (cur == null) {
+          action = "";
+        } else {
+          action = '<button class="danger" data-forfeit="' + UI.esc(cur) + '">弃权</button> ' +
+                   '<button class="secondary" data-confirm-slot="' + i + '" data-confirm-entry="' + UI.esc(cur) + '">确认发放</button>';
+        }
         return (
           '<tr class="winner-row"><td class="rank">' + (i + 1) + "</td>" +
           '<td class="mono">' + UI.esc(w) + "</td>" +
@@ -103,6 +113,14 @@
       Array.prototype.forEach.call(document.querySelectorAll("[data-forfeit]"), function (btn) {
         btn.addEventListener("click", function () { forfeitEntry(btn.getAttribute("data-forfeit")); });
       });
+      Array.prototype.forEach.call(document.querySelectorAll("[data-confirm-slot]"), function (btn) {
+        btn.addEventListener("click", function () {
+          confirmPrize(
+            parseInt(btn.getAttribute("data-confirm-slot"), 10),
+            btn.getAttribute("data-confirm-entry")
+          );
+        });
+      });
 
       $("forfeitCard").style.display = forfeits.length ? "block" : "none";
       $("forfeitList").innerHTML = forfeits.map(function (f) {
@@ -111,6 +129,16 @@
           "<td class='mono'>" + UI.esc(f.at || "") + "</td>" +
           "<td class='mono'>" + UI.esc(f.entry) + "</td>" +
           "<td class='mono'>" + (f.replacement == null ? "（无候补，席位留空）" : UI.esc(f.replacement)) + "</td></tr>"
+        );
+      }).join("");
+
+      $("confirmCard").style.display = confirms.length ? "block" : "none";
+      $("confirmList").innerHTML = confirms.map(function (c) {
+        return (
+          "<tr><td class='rank'>" + (c.slot + 1) + "</td>" +
+          "<td class='mono'>" + UI.esc(c.entry) + "</td>" +
+          "<td>" + c.forfeitsBefore + "</td>" +
+          "<td class='mono'>" + UI.esc(c.at || "") + "</td></tr>"
         );
       }).join("");
     }
@@ -232,6 +260,33 @@
         UI.flash(
           flashEl,
           "已记录弃权：" + entry + (rep ? "，递补为 " + rep : "，名单已无人可补，席位留空") + "。",
+          "ok"
+        );
+      }
+      await refresh();
+    } catch (e) { UI.flash(flashEl, e.message, "err"); }
+  }
+
+  // ---------------- 奖品发放确认（仅 revealed，仅当前有人占用的席位）
+
+  async function confirmPrize(slot, entry) {
+    if (!confirm(
+      "确认席位 " + (slot + 1) + " 的奖品已发放给当前有效编号「" + entry + "」？\n" +
+      "系统会记录席位、当时编号与确认前的弃权次数；确认后该席位不能再弃权，" +
+      "其他席位仍可照常弃权递补。"
+    )) return;
+    try {
+      var data = await UI.api("/api/rounds/" + encodeURIComponent(ROUND_ID) + "/confirm", {
+        method: "POST",
+        body: JSON.stringify({ slot: slot, entry: entry }),
+      });
+      if (data.alreadyConfirmed) {
+        UI.flash(flashEl, data.message, "warn");
+      } else {
+        UI.flash(
+          flashEl,
+          "已登记发放确认：席位 " + (slot + 1) + " 编号 " + entry +
+          "（确认前弃权 " + data.confirmation.forfeitsBefore + " 次）。该席位此后不能再弃权。",
           "ok"
         );
       }

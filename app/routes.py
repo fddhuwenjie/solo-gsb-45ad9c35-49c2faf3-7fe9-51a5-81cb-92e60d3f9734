@@ -59,6 +59,7 @@ def round_public_dict(row, *, include_snapshot: bool = True) -> dict:
     participants = services.participant_rows(db, row["id"])
     winners = json.loads(row["winners_json"]) if row["winners_json"] else None
     forfeits = services.forfeit_rows(db, row["id"])
+    confirmations = services.confirmation_rows(db, row["id"])
     data = {
         "id": row["id"],
         "title": row["title"],
@@ -80,6 +81,8 @@ def round_public_dict(row, *, include_snapshot: bool = True) -> dict:
         "slots": services.current_slots(winners, forfeits)
         if winners is not None
         else None,
+        # 奖品发放确认记录（未揭晓时为 []）
+        "confirmations": confirmations,
         "participants": participants,
     }
     if include_snapshot and row["snapshot"] is not None:
@@ -271,6 +274,45 @@ def forfeit_entry(round_id):
     )
 
 
+# -------------------------------------------------------- 奖品发放确认
+
+@bp.post("/api/rounds/<round_id>/confirm")
+def confirm_prize(round_id):
+    body = request.get_json(silent=True) or {}
+    db = get_db()
+    try:
+        with transaction(db):
+            result = services.confirm_tx(
+                db, round_id, body.get("slot"), body.get("entry")
+            )
+    except ApiError as e:
+        return _error_response(e)
+
+    # 同一席位同一编号重复提交：原样返回既有记录
+    if result.get("already_confirmed"):
+        return jsonify(
+            {
+                "ok": True,
+                "alreadyConfirmed": True,
+                "message": "该席位该编号已登记奖品发放确认，重复提交返回既有记录",
+                "round": round_public_dict(result["row"]),
+            }
+        )
+
+    c = result["confirmation"]
+    return jsonify(
+        {
+            "ok": True,
+            "confirmation": {
+                "slot": c["slot"],
+                "entry": c["entry"],
+                "forfeitsBefore": c["forfeitsBefore"],
+            },
+            "round": round_public_dict(result["row"]),
+        }
+    )
+
+
 # ---------------------------------------------------------------- 核验包
 
 def build_manifest(row) -> dict:
@@ -285,6 +327,7 @@ def build_manifest(row) -> dict:
 
     winners = json.loads(row["winners_json"]) if row["winners_json"] else None
     forfeits = services.forfeit_rows(get_db(), row["id"])
+    confirmations = services.confirmation_rows(get_db(), row["id"])
     return {
         "format": "public-lottery-verification-v1",
         "ruleId": rules.RULE_ID,
@@ -308,11 +351,17 @@ def build_manifest(row) -> dict:
         "currentWinners": services.current_slots(winners, forfeits)
         if winners is not None
         else None,
+        # 奖品发放确认（RULES.md 第 5 节）：席位、当时编号、确认前弃权次数；
+        # 旧版包无此字段，核验器按无确认处理（仍逐条核对弃权与当前席位）
+        "confirmations": confirmations,
         "notes": (
             "用 verify/verify.py 对本文件独立重算校验；切勿只比对本包内 winners 字段。"
             "封存后（含未揭晓）即可导出并对照事先留存的承诺与名单摘要。"
             "forfeits/currentWinners 为弃权递补记录与当前有效席位，"
             "核验器会从种子与封存名单按规则独立重演，能指出伪造或跳过的递补。"
+            "confirmations 为奖品发放确认记录（席位、当时编号、确认前弃权次数），"
+            "核验器按弃权顺序重演确认当时的席位持有者，能识别伪造编号、"
+            "错置的确认阶段或确认之后的弃权。"
         ),
     }
 

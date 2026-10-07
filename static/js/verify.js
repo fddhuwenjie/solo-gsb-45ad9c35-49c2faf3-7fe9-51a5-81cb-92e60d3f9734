@@ -155,19 +155,20 @@
     heading("独立重算的中奖编号（按产生顺序）");
     recalc.forEach(function (w, i) { info("  " + (i + 1) + ". " + w); });
 
-    // ---- 弃权与递补：从种子与名单独立重演（旧版包无此字段，按无弃权处理）----
+    // ---- 弃权/递补与发放确认：从种子与名单独立重演（旧版包无字段，按无记录处理）----
     if (!("forfeits" in pkg) && !("currentWinners" in pkg)) {
       info("旧版核验包：无弃权字段，按无弃权处理。");
     } else {
-      verifyForfeits(pkg, entries, seed, rnd.prizeCount, recalc, pass, fail, info, heading);
+      verifyPostReveal(pkg, entries, seed, rnd.prizeCount, recalc, pass, fail, info, heading);
     }
     return finish(failures);
   }
 
-  // 重演弃权/递补记录（RULES.md 第 4 节）：第 k 次弃权的递补必须是扩展抽签
-  // 序列的第 prizeCount+k 个编号；弃权时该编号必须仍在有效席位中；
-  // 最终当前席位必须与包内 currentWinners 完全一致。
-  function verifyForfeits(pkg, entries, seed, prizeCount, recalc, pass, fail, info, heading) {
+  // 揭晓后的全部追加记录（弃权/递补 + 奖品发放确认）统一重演：
+  // 第 j 条弃权发生在“阶段 j→j+1”之间；发放确认带 forfeitsBefore，表示它
+  // 发生在第 forfeitsBefore 次弃权之后。逐阶段先安置确认、再重演弃权，
+  // 可识别伪造编号、错置的确认阶段、确认后的弃权。旧版包无确认字段按无确认处理。
+  function verifyPostReveal(pkg, entries, seed, prizeCount, recalc, pass, fail, info, heading) {
     var forfeits = pkg.forfeits;
     if (!Array.isArray(forfeits)) {
       fail("forfeits 字段必须是数组");
@@ -182,13 +183,91 @@
 
     var total = prizeCount + forfeits.length;
     var extended = LotteryRules.drawWinners(entries, seed, Math.min(total, entries.length));
+
+    // ---- 发放确认的结构校验与按阶段分组 ----
+    var hasConfirmField = ("confirmations" in pkg);
+    var confirmations = hasConfirmField ? pkg.confirmations : [];
+    var byPhase = Object.create(null);
+    var confirmValid = true;
+    if (hasConfirmField) {
+      if (!Array.isArray(confirmations) ||
+          !confirmations.every(function (c) { return c && typeof c === "object"; })) {
+        fail("confirmations 字段必须是对象数组");
+        confirmValid = false;
+      } else {
+        var seenSlots = Object.create(null);
+        confirmations.forEach(function (c) {
+          var slot = c.slot, fb = c.forfeitsBefore, cEntry = c.entry;
+          if (typeof slot !== "number" || slot !== (slot | 0) ||
+              slot < 0 || slot >= prizeCount) {
+            fail("发放确认席位非法：" + JSON.stringify(slot) +
+                 "（应为 0 至 " + (prizeCount - 1) + " 的整数）");
+            confirmValid = false;
+            return;
+          }
+          if (seenSlots[slot]) {
+            fail("席位 " + (slot + 1) + " 出现多条发放确认（每席位至多确认一次）");
+            confirmValid = false;
+            return;
+          }
+          seenSlots[slot] = 1;
+          if (typeof fb !== "number" || fb !== (fb | 0) ||
+              fb < 0 || fb > forfeits.length) {
+            fail("席位 " + (slot + 1) + " 的发放确认 forfeitsBefore 非法：" +
+                 JSON.stringify(fb) + "（应为 0 至弃权总次数 " + forfeits.length +
+                 " 的整数，确认阶段被错置）");
+            confirmValid = false;
+            return;
+          }
+          if (typeof cEntry !== "string" || !cEntry) {
+            fail("席位 " + (slot + 1) + " 的发放确认缺少 entry（确认编号）");
+            confirmValid = false;
+            return;
+          }
+          (byPhase[fb] = byPhase[fb] || []).push(c);
+        });
+      }
+    }
+
+    // ---- 逐阶段重演 ----
     var slots = recalc.slice();
+    var locked = Object.create(null); // 已确认席位 slot -> entry
+
+    function applyPhaseConfirmations(phase) {
+      var list = byPhase[phase] || [];
+      list.forEach(function (c) {
+        var holder = slots[c.slot];
+        if (holder === null || holder === undefined) {
+          fail("席位 " + (c.slot + 1) + " 的发放确认（" + c.entry +
+               "）无法重演：该阶段此席位为空席（空席不能确认，记录系伪造）");
+          confirmValid = false;
+          return;
+        }
+        if (c.entry !== holder) {
+          fail("席位 " + (c.slot + 1) + " 的发放确认编号为 " + c.entry +
+               "，但确认阶段（第 " + phase + " 次弃权之后）该席位的持有者是 " +
+               holder + "（伪造编号或错置的确认阶段）");
+          confirmValid = false;
+          return;
+        }
+        locked[c.slot] = c.entry;
+      });
+    }
+
     for (var j = 0; j < forfeits.length; j++) {
+      applyPhaseConfirmations(j);
       var f = forfeits[j];
       var expect = (prizeCount + j) < entries.length ? extended[prizeCount + j] : null;
-      if (slots.indexOf(f.entry) < 0) {
+      var fslot = slots.indexOf(f.entry);
+      if (fslot < 0) {
         fail("第 " + (j + 1) + " 条弃权记录无法重演：编号 " + f.entry +
              " 当时不在有效席位中（弃权顺序被篡改或记录系伪造）");
+        return;
+      }
+      if (String(fslot) in locked) {
+        fail("第 " + (j + 1) + " 条弃权（席位 " + (fslot + 1) + "，编号 " + f.entry +
+             "）发生在该席位奖品发放确认（" + locked[fslot] +
+             "）之后：已确认席位不能再弃权（确认后的弃权系伪造）");
         return;
       }
       var rep = f.replacement === undefined ? null : f.replacement;
@@ -198,13 +277,24 @@
              (expect === null ? "（无候补）" : expect) + "（伪造或跳过的递补）");
         return;
       }
-      slots[slots.indexOf(f.entry)] = expect;
+      slots[fslot] = expect;
     }
+    applyPhaseConfirmations(forfeits.length);
 
     if (forfeits.length) {
       pass(forfeits.length + " 条弃权/递补记录按规则从种子与名单重演，全部一致");
     } else {
       pass("无弃权记录");
+    }
+    if (hasConfirmField) {
+      if (confirmations.length && confirmValid) {
+        pass(confirmations.length +
+             " 条奖品发放确认按弃权顺序重演确认当时的席位持有者，全部一致");
+      } else if (!confirmations.length) {
+        pass("无奖品发放确认记录");
+      }
+    } else {
+      pass("旧版核验包：无发放确认字段，按无确认处理");
     }
 
     var current = pkg.currentWinners;
@@ -219,23 +309,41 @@
             diffs.push("席位 " + (i + 1) + "：包内 " + current[i] + "，重演 " + slots[i]);
           }
         }
-        fail("当前有效席位与弃权重演结果不一致：\n" + diffs.slice(0, 20).join("\n"));
+        fail("当前有效席位与重演结果不一致：\n" + diffs.slice(0, 20).join("\n"));
       } else {
-        pass("当前有效席位（currentWinners）与弃权重演结果一致");
+        pass("当前有效席位（currentWinners）与弃权/确认重演结果一致");
       }
+      // 已确认席位的当前持有者必须仍是确认时的编号
+      Object.keys(locked).forEach(function (sStr) {
+        var s = parseInt(sStr, 10);
+        if (Array.isArray(current) && current[s] !== locked[s]) {
+          fail("席位 " + (s + 1) + " 已确认发放给 " + locked[s] +
+               "，但当前席位为 " + current[s] + "（确认后席位不应再变化）");
+        }
+      });
     }
 
-    if (forfeits.length) {
-      heading("弃权与递补记录（按操作顺序，已经规则重演核对）");
-      forfeits.forEach(function (f) {
-        info("  #" + (f.seq + 1) + " 弃权 " + f.entry + " → 递补 " +
-             (f.replacement == null ? "（无候补，席位留空）" : f.replacement));
-      });
-      heading("当前有效席位");
-      slots.forEach(function (s, i) {
-        info("  " + (i + 1) + ". " + (s === null ? "（空席）" : s));
+    heading("弃权与递补记录（按操作顺序，已经规则重演核对）");
+    if (!forfeits.length) info("（无）");
+    forfeits.forEach(function (f) {
+      info("  #" + (f.seq + 1) + " 弃权 " + f.entry + " → 递补 " +
+           (f.replacement == null ? "（无候补，席位留空）" : f.replacement));
+    });
+    if (hasConfirmField && confirmations.length) {
+      heading("奖品发放确认（已经弃权顺序重演确认当时的席位持有者）");
+      confirmations.slice().sort(function (a, b) {
+        return (typeof a.slot === "number" ? a.slot : -1) -
+               (typeof b.slot === "number" ? b.slot : -1);
+      }).forEach(function (c) {
+        info("  席位 " + (c.slot + 1) + "  编号 " + c.entry +
+             "（确认前弃权 " + c.forfeitsBefore + " 次）");
       });
     }
+    heading("当前有效席位");
+    slots.forEach(function (s, i) {
+      info("  " + (i + 1) + ". " + (s === null ? "（空席）" : s) +
+           (String(i) in locked ? "  ✅ 已确认发放" : ""));
+    });
   }
 
   function finish(failures) {

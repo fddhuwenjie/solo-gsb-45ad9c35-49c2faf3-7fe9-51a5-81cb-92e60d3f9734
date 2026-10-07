@@ -86,7 +86,7 @@
     <dt>揭晓时间</dt><dd id="revealedAt" class="mono"></dd>
   </dl>
   <table style="margin-top:10px;">
-    <thead><tr><th class="rank">席位</th><th>原中奖编号</th><th>当前有效编号</th><th>递补经过</th><th></th></tr></thead>
+    <thead><tr><th class="rank">席位</th><th>原中奖编号</th><th>当前有效编号</th><th>递补经过</th><th>操作</th></tr></thead>
     <tbody id="winnerList"></tbody>
   </table>
   <p class="muted">
@@ -94,6 +94,21 @@
     系统立即按同一公开规则（sha256-argmax-v1）从封存名单中接着选出尚未出现的编号补入其席位；
     名单无人可补时席位留空。弃权只追加记录，不改写原始结果。
   </p>
+  <p class="muted">
+    对当前有人占用的席位还可登记<strong>奖品发放确认</strong>：系统记录席位、当时编号与确认前的弃权次数，
+    并随核验包导出供独立重演。<strong>确认后该席位不能再弃权</strong>，其他席位仍可照常弃权递补；
+    同一席位同一编号重复提交只返回既有记录，空席或旧编号（已被递补替换）的确认会被拒绝。
+  </p>
+</div>
+
+<!-- 奖品发放确认记录 -->
+<div class="card" id="confirmCard" style="display:none;">
+  <h2>奖品发放确认记录（已确认席位）</h2>
+  <table>
+    <thead><tr><th class="rank">席位</th><th>确认编号</th><th>确认前弃权次数</th><th>确认时间</th></tr></thead>
+    <tbody id="confirmList"></tbody>
+  </table>
+  <p class="muted">确认后该席位锁定，不能再弃权；以上记录随核验包导出，核验器会按弃权顺序重演确认当时的席位持有者。</p>
 </div>
 
 <!-- 弃权与递补记录 -->
@@ -110,7 +125,8 @@
 <div class="card" id="exportCard" style="display:none;">
   <h2>导出核验包</h2>
   <p class="muted">
-    核验包含种子（未揭晓时为空）、规范名单、名单摘要、规则标识、承诺与结果。
+    核验包含种子（未揭晓时为空）、规范名单、名单摘要、规则标识、承诺、结果、
+    弃权/递补记录与奖品发放确认记录。
     zip 内附 <span class="mono">verify.py</span> 与 <span class="mono">RULES.md</span>，
     任何人可用 <span class="mono">python3 verify.py 包文件</span> 从种子和名单<strong>独立重算</strong>核对，
     而不是只比对已保存的中奖列表。

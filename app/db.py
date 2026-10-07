@@ -4,7 +4,8 @@
     open     可登记/修改名单
     sealed   名单已封存，等待提交种子；承诺不符仍停留在此状态
     revealed 种子匹配承诺，中奖结果一次性写入，永久拒绝重抽；
-             此后只允许追加弃权记录（forfeits 表），原始中奖结果与揭晓时间不变
+             此后只允许追加弃权（forfeits 表）与奖品发放确认（confirmations 表）
+             记录；原始中奖结果与揭晓时间不变
 
 并发约定：
     所有“读状态—改数据—提交”的写流程必须使用 ``transaction()``（BEGIN IMMEDIATE）。
@@ -13,6 +14,9 @@
     状态与名单，不会出现“封存读到旧名单、变更通过旧状态检查”的交错。
     弃权/递补同理：同一轮次的弃权操作在写锁内重新读取既有弃权记录后再追加，
     因此两次并发弃权必然串行生效，各自拿到扩展抽签序列中不同的下一个递补。
+    奖品发放确认与同席位弃权也在同一把写锁上串行：弃权先提交则确认只能读到
+    递补后的新席位持有者（旧编号确认失败）；确认先提交则弃权在锁内读到确认
+    记录而失败。检查与写入同一事务，不会留下半次操作。
 """
 import sqlite3
 from contextlib import contextmanager
@@ -59,6 +63,19 @@ CREATE TABLE IF NOT EXISTS forfeits (
 );
 
 CREATE INDEX IF NOT EXISTS idx_forfeits_round ON forfeits(round_id);
+
+-- 奖品发放确认（仅 revealed）：每席位至多一条；记录确认时的席位持有者与
+-- 确认前已完成的弃权次数（forfeits_before）。已确认席位之后的弃权一律拒绝。
+CREATE TABLE IF NOT EXISTS confirmations (
+    round_id       TEXT NOT NULL REFERENCES rounds(id),
+    slot           INTEGER NOT NULL,        -- 席位序号（0 起，对应 winners 下标）
+    entry_id       TEXT NOT NULL,           -- 确认时该席位的当前有效编号（快照）
+    forfeits_before INTEGER NOT NULL,       -- 确认前已完成的弃权次数（阶段号）
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (round_id, slot)
+);
+
+CREATE INDEX IF NOT EXISTS idx_confirmations_round ON confirmations(round_id);
 """
 
 

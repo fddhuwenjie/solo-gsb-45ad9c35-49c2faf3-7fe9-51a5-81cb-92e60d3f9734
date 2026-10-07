@@ -11,6 +11,9 @@
 中奖编号一律由种子和名单按公开规则重新计算后逐项比对；
 弃权/递补记录（forfeits/currentWinners，RULES.md 第 4 节）也从种子与名单
 独立重演核对，能指出伪造或跳过的递补。旧版核验包（无弃权字段）按无弃权处理。
+奖品发放确认（confirmations，RULES.md 第 5 节）按“确认前弃权次数”被放回
+弃权序列的对应阶段重演：核验确认当时的席位持有者、识别伪造编号、错置的确认
+阶段或确认之后的弃权；旧版核验包（无确认字段）按无确认处理。
 发现任何不符，退出码为 1；全部通过退出码为 0。
 """
 import argparse
@@ -222,23 +225,33 @@ def verify(pkg, expected_commitment=None, expected_digest=None):
         for i, w in enumerate(recalc, 1):
             print(f"  {i:>3}. {w}")
 
-        # ---- 弃权与递补：从种子与名单独立重演（旧版包无此字段，按无弃权处理）----
+        # ---- 弃权/递补与发放确认：从种子与名单独立重演 ----
+        # 旧版包无弃权字段：按无弃权、无确认处理
         if "forfeits" not in pkg and "currentWinners" not in pkg:
             ok("旧版核验包：无弃权字段，按无弃权处理")
         else:
-            _verify_forfeits(pkg, entries, seed, prize_count, recalc, ok, fail)
+            _verify_post_reveal(
+                pkg, entries, seed, prize_count, recalc, ok, fail
+            )
     elif prize_count is not None and prize_count > len(entries):
         fail(f"人数 {len(entries)} 少于名额 {prize_count}，按规则本不该封存/揭晓")
 
     return errors, checks
 
 
-def _verify_forfeits(pkg, entries, seed, prize_count, recalc, ok, fail):
-    """重演弃权/递补记录（RULES.md 第 4 节）。
+def _verify_post_reveal(pkg, entries, seed, prize_count, recalc, ok, fail):
+    """揭晓后的全部追加记录（弃权/递补 + 奖品发放确认）统一重演。
 
-    第 k 次弃权（k 从 0 起）的递补必须是扩展抽签序列的第 prize_count+k 个
-    编号；弃权发生时该编号必须仍在有效席位中；最终当前席位必须与包内
-    currentWinners 完全一致。任何不符都说明记录被伪造或递补被跳过。
+    两条记录流必须在同一条事件时间线上自洽：
+
+    - 第 j 条弃权（j 从 0 起）发生在“阶段” j 与 j+1 之间，其递补必须是扩展
+      抽签序列第 prize_count+j 个编号（无候补则为 null），弃权编号当时必须
+      正在有效席位中，且该席位不得已做发放确认（确认后的弃权不可能发生）；
+    - 发放确认带 forfeitsBefore 字段：它发生在阶段 forfeitsBefore 之后、
+      下一次弃权之前；确认的编号必须正是该阶段该席位的持有者（伪造编号、
+      错置的确认阶段都会对不上）；同一席位至多一条确认。
+
+    最终当前席位必须与包内 currentWinners 完全一致。
     """
     forfeits = pkg.get("forfeits")
     current = pkg.get("currentWinners")
@@ -254,8 +267,79 @@ def _verify_forfeits(pkg, entries, seed, prize_count, recalc, ok, fail):
     total = prize_count + len(forfeits)
     extended = draw_winners(entries, seed, min(total, len(entries)))
 
+    # ---- 发放确认的结构校验与按阶段分组（缺失字段视为无确认，兼容旧包）----
+    confirmations = pkg.get("confirmations", [])
+    has_confirm_field = "confirmations" in pkg
+    by_phase = {}
+    confirm_valid = True
+    if has_confirm_field:
+        if not isinstance(confirmations, list) or not all(
+            isinstance(c, dict) for c in confirmations
+        ):
+            fail("confirmations 字段必须是对象数组")
+            confirm_valid = False
+        else:
+            seen_slots = set()
+            for c in confirmations:
+                slot = c.get("slot")
+                fb = c.get("forfeitsBefore")
+                c_entry = c.get("entry")
+                if not isinstance(slot, int) or isinstance(slot, bool) \
+                        or not 0 <= slot < prize_count:
+                    fail(
+                        f"发放确认席位非法：{slot!r}（应为 0 至 "
+                        f"{prize_count - 1} 的整数）"
+                    )
+                    confirm_valid = False
+                    continue
+                if slot in seen_slots:
+                    fail(
+                        f"席位 {slot + 1} 出现多条发放确认"
+                        "（每席位至多确认一次）"
+                    )
+                    confirm_valid = False
+                    continue
+                seen_slots.add(slot)
+                if not isinstance(fb, int) or isinstance(fb, bool) \
+                        or not 0 <= fb <= len(forfeits):
+                    fail(
+                        f"席位 {slot + 1} 的发放确认 forfeitsBefore 非法："
+                        f"{fb!r}（应为 0 至弃权总次数 {len(forfeits)} 的整数，"
+                        "确认阶段被错置）"
+                    )
+                    confirm_valid = False
+                    continue
+                if not isinstance(c_entry, str) or not c_entry:
+                    fail(f"席位 {slot + 1} 的发放确认缺少 entry（确认编号）")
+                    confirm_valid = False
+                    continue
+                by_phase.setdefault(fb, []).append(c)
+
+    # ---- 逐阶段重演：先安置本阶段的确认，再重演本阶段的弃权 ----
     slots = list(recalc)
+    locked = {}  # slot -> 已确认的编号；该席位之后的弃权必须失败（即记录非法）
     for j, f in enumerate(forfeits):
+        # 阶段 j（第 j 条弃权之前）完成的确认
+        for c in by_phase.get(j, []):
+            slot, c_entry = c["slot"], c["entry"]
+            holder = slots[slot]
+            if holder is None:
+                fail(
+                    f"席位 {slot + 1} 的发放确认（{c_entry!r}）无法重演："
+                    "该阶段此席位为空席（空席不能确认，记录系伪造）"
+                )
+                confirm_valid = False
+                continue
+            if c_entry != holder:
+                fail(
+                    f"席位 {slot + 1} 的发放确认编号为 {c_entry!r}，但确认阶段"
+                    f"（第 {j} 次弃权之前）该席位的持有者是 {holder!r}"
+                    "（伪造编号或错置的确认阶段）"
+                )
+                confirm_valid = False
+                continue
+            locked[slot] = c_entry
+
         entry = f.get("entry")
         expect = (
             extended[prize_count + j]
@@ -268,6 +352,14 @@ def _verify_forfeits(pkg, entries, seed, prize_count, recalc, ok, fail):
                 "席位中（弃权顺序被篡改或记录系伪造）"
             )
             return
+        fslot = slots.index(entry)
+        if fslot in locked:
+            fail(
+                f"第 {j + 1} 条弃权（席位 {fslot + 1}，编号 {entry!r}）"
+                f"发生在该席位奖品发放确认（{locked[fslot]!r}）之后："
+                "已确认席位不能再弃权（确认后的弃权系伪造）"
+            )
+            return
         if f.get("replacement") != expect:
             fail(
                 f"第 {j + 1} 条弃权（{entry!r}）的递补不符：包内为 "
@@ -275,12 +367,44 @@ def _verify_forfeits(pkg, entries, seed, prize_count, recalc, ok, fail):
                 "（伪造或跳过的递补）"
             )
             return
-        slots[slots.index(entry)] = expect
+        slots[fslot] = expect
+
+    # 最后一个阶段（全部弃权之后）完成的确认
+    for c in by_phase.get(len(forfeits), []):
+        slot, c_entry = c["slot"], c["entry"]
+        holder = slots[slot]
+        if holder is None:
+            fail(
+                f"席位 {slot + 1} 的发放确认（{c_entry!r}）无法重演："
+                "该席位当前为空席（空席不能确认，记录系伪造）"
+            )
+            confirm_valid = False
+            continue
+        if c_entry != holder:
+            fail(
+                f"席位 {slot + 1} 的发放确认编号为 {c_entry!r}，但全部弃权"
+                f"结束后该席位的持有者是 {holder!r}"
+                "（伪造编号或错置的确认阶段）"
+            )
+            confirm_valid = False
+            continue
+        locked[slot] = c_entry
 
     if forfeits:
         ok(f"{len(forfeits)} 条弃权/递补记录按规则从种子与名单重演，全部一致")
     else:
         ok("无弃权记录")
+
+    if has_confirm_field:
+        if confirmations and confirm_valid:
+            ok(
+                f"{len(confirmations)} 条奖品发放确认按弃权顺序重演确认当时的"
+                "席位持有者，全部一致"
+            )
+        elif not confirmations:
+            ok("无奖品发放确认记录")
+    else:
+        ok("旧版核验包：无发放确认字段，按无确认处理")
 
     if current is None:
         fail("核验包缺少 currentWinners（当前有效席位）字段")
@@ -291,12 +415,21 @@ def _verify_forfeits(pkg, entries, seed, prize_count, recalc, ok, fail):
         for i, (a, b) in enumerate(zip(current, slots)):
             if a != b:
                 diffs.append(f"席位 {i + 1}：包内 {a!r}，重演 {b!r}")
-        fail("当前有效席位与弃权重演结果不一致：\n    " + "\n    ".join(diffs[:20]))
+        fail("当前有效席位与重演结果不一致：\n    " + "\n    ".join(diffs[:20]))
     else:
-        ok("当前有效席位（currentWinners）与弃权重演结果一致")
+        ok("当前有效席位（currentWinners）与弃权/确认重演结果一致")
 
+    # 已确认席位的当前持有者必须仍是确认时的编号（额外显式比对）
+    for slot, c_entry in locked.items():
+        if current is not None and 0 <= slot < len(current) \
+                and current[slot] != c_entry:
+            fail(
+                f"席位 {slot + 1} 已确认发放给 {c_entry!r}，但当前席位为 "
+                f"{current[slot]!r}（确认后席位不应再变化）"
+            )
+
+    print("-" * 68)
     if forfeits:
-        print("-" * 68)
         print("弃权与递补记录（按操作顺序，已经规则重演核对）：")
         for f in forfeits:
             rep = f.get("replacement")
@@ -304,9 +437,22 @@ def _verify_forfeits(pkg, entries, seed, prize_count, recalc, ok, fail):
                 f"  #{str(f.get('seq', '?')):>3} 弃权 {f.get('entry')} → "
                 f"递补 {rep if rep is not None else '（无候补，席位留空）'}"
             )
-        print("当前有效席位：")
-        for i, s in enumerate(slots, 1):
-            print(f"  {i:>3}. {s if s is not None else '（空席）'}")
+    if has_confirm_field and confirmations:
+        print("奖品发放确认（已经弃权顺序重演确认当时的席位持有者）：")
+        valid_dicts = [c for c in confirmations if isinstance(c, dict)]
+        for c in sorted(
+            valid_dicts,
+            key=lambda x: x.get("slot") if isinstance(x.get("slot"), int) else -1,
+        ):
+            slot_no = c.get("slot") + 1 if isinstance(c.get("slot"), int) else "?"
+            print(
+                f"  席位 {slot_no}  编号 {c.get('entry')}"
+                f"（确认前弃权 {c.get('forfeitsBefore', '?')} 次）"
+            )
+    print("当前有效席位：")
+    for i, s in enumerate(slots, 1):
+        mark = "  ✅ 已确认发放" if (i - 1) in locked else ""
+        print(f"  {i:>3}. {s if s is not None else '（空席）'}{mark}")
 
 
 def main(argv=None):
